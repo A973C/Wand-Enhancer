@@ -1,0 +1,38 @@
+name: Auto release
+
+on:
+  workflow_run:
+    workflows: ["Build executable"]
+    types: [completed]
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  release:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      SHA: ${{ github.event.workflow_run.head_sha }}
+    steps:
+      - name: Télécharger l'exécutable
+        run: |
+          gh run download ${{ github.event.workflow_run.id }} \
+            -n WandEnhancer-unsigned -D dist -R ${{ github.repository }}
+
+      - name: Préparer l'archive
+        id: pack
+        run: |
+          TAG="build-$(date -u +%Y%m%d-%H%M)-${SHA:0:7}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          cd dist && zip "../WandEnhancer-$TAG.zip" WandEnhancer.exe
+
+      - name: Créer la release
+        run: |
+          gh release create "${{ steps.pack.outputs.tag }}" \
+            "WandEnhancer-${{ steps.pack.outputs.tag }}.zip" \
+            --target "$SHA" \
+            --title "Build automatique ${{ steps.pack.outputs.tag }}" \
+            --notes "Build non signé, généré automatiquement depuis le commit \`$SHA\`."
