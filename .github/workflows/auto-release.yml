@@ -1,0 +1,81 @@
+name: Auto release
+
+on:
+  workflow_run:
+    workflows: ["Build executable"]
+    types: [completed]
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  release:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      SHA: ${{ github.event.workflow_run.head_sha }}
+      VT_THRESHOLD: 8   # au-delà de X détections, on ne publie pas
+    steps:
+      - name: Télécharger l'exécutable
+        run: |
+          gh run download ${{ github.event.workflow_run.id }} \
+            -n WandEnhancer-unsigned -D dist -R ${{ github.repository }}
+
+      - name: Analyse VirusTotal
+        id: vt
+        env:
+          VT_API_KEY: ${{ secrets.VT_API_KEY }}
+        run: |
+          set -e
+          HASH=$(sha256sum dist/WandEnhancer.exe | cut -d' ' -f1)
+          echo "permalink=https://www.virustotal.com/gui/file/$HASH" >> "$GITHUB_OUTPUT"
+
+          ID=$(curl -s -X POST https://www.virustotal.com/api/v3/files \
+                 -H "x-apikey: $VT_API_KEY" \
+                 -F "file=@dist/WandEnhancer.exe" | jq -r .data.id)
+
+          for i in $(seq 1 20); do
+            sleep 30
+            RESP=$(curl -s "https://www.virustotal.com/api/v3/analyses/$ID" -H "x-apikey: $VT_API_KEY")
+            STATUS=$(echo "$RESP" | jq -r .data.attributes.status)
+            echo "Tentative $i : $STATUS"
+            [ "$STATUS" = "completed" ] && break
+          done
+
+          if [ "$STATUS" != "completed" ]; then
+            echo "::error::Analyse non terminée dans le temps imparti."
+            exit 1
+          fi
+
+          MAL=$(echo "$RESP" | jq -r .data.attributes.stats.malicious)
+          SUS=$(echo "$RESP" | jq -r .data.attributes.stats.suspicious)
+          TOTAL=$(echo "$RESP" | jq -r '[.data.attributes.stats[]] | add')
+          echo "Résultat : $MAL malveillant / $SUS suspect / $TOTAL moteurs"
+          echo "verdict=$MAL detections sur $TOTAL moteurs (+$SUS suspects)" >> "$GITHUB_OUTPUT"
+
+          if [ "$MAL" -gt "$VT_THRESHOLD" ]; then
+            echo "::error::Seuil dépassé ($MAL > $VT_THRESHOLD). Publication annulée."
+            exit 1
+          fi
+
+      - name: Préparer l'archive
+        id: pack
+        run: |
+          TAG="build-$(date -u +%Y%m%d-%H%M)-${SHA:0:7}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          cd dist && zip "../WandEnhancer-$TAG.zip" WandEnhancer.exe
+
+      - name: Créer la release
+        run: |
+          gh release create "${{ steps.pack.outputs.tag }}" \
+            "WandEnhancer-${{ steps.pack.outputs.tag }}.zip" \
+            --target "$SHA" \
+            --title "Build automatique ${{ steps.pack.outputs.tag }}" \
+            --notes "Build non signé, généré depuis le commit \`$SHA\`.
+
+          **VirusTotal :** ${{ steps.vt.outputs.verdict }}
+          Rapport : ${{ steps.vt.outputs.permalink }}
+
+          Des détections génériques (\`Wacatac!ml\`, \`Krypt\`) sont attendues sur un binaire non signé et sans prévalence."
