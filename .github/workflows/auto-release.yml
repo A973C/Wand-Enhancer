@@ -71,6 +71,7 @@ jobs:
         run: |
           gh release create "${{ steps.pack.outputs.tag }}" \
             "WandEnhancer-${{ steps.pack.outputs.tag }}.zip" \
+            -R ${{ github.repository }} \
             --target "$SHA" \
             --title "Build automatique ${{ steps.pack.outputs.tag }}" \
             --notes "Build non signé, généré depuis le commit \`$SHA\`.
