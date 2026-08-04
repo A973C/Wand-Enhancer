@@ -15,13 +15,12 @@ jobs:
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
       SHA: ${{ github.event.workflow_run.head_sha }}
       VT_THRESHOLD: 8   # au-delà de X détections, on ne publie pas
     steps:
       - name: Télécharger l'exécutable
-        run: |
-          gh run download ${{ github.event.workflow_run.id }} \
-            -n WandEnhancer-unsigned -D dist -R ${{ github.repository }}
+        run: gh run download ${{ github.event.workflow_run.id }} -n WandEnhancer-unsigned -D dist
 
       - name: Analyse VirusTotal
         id: vt
@@ -71,7 +70,6 @@ jobs:
         run: |
           gh release create "${{ steps.pack.outputs.tag }}" \
             "WandEnhancer-${{ steps.pack.outputs.tag }}.zip" \
-            -R ${{ github.repository }} \
             --target "$SHA" \
             --title "Build automatique ${{ steps.pack.outputs.tag }}" \
             --notes "Build non signé, généré depuis le commit \`$SHA\`.
