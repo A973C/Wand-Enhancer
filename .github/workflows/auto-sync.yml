@@ -1,1 +1,35 @@
+name: Auto sync + build
 
+on:
+  schedule:
+    - cron: '0 4 * * *'   # tous les jours à 04h00 UTC
+  workflow_dispatch:       # permet aussi de le lancer à la main
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      BRANCH: ${{ github.event.repository.default_branch }}
+    steps:
+      - name: Synchroniser avec le repo original
+        id: sync
+        run: |
+          before=$(gh api repos/${{ github.repository }}/commits/$BRANCH --jq .sha)
+          gh api --method POST repos/${{ github.repository }}/merge-upstream -f branch=$BRANCH
+          after=$(gh api repos/${{ github.repository }}/commits/$BRANCH --jq .sha)
+          if [ "$before" != "$after" ]; then
+            echo "Nouveaux commits detectes : $before -> $after"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Aucune mise a jour."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Lancer le build si mise à jour
+        if: steps.sync.outputs.changed == 'true'
+        run: gh workflow run build.yml --ref $BRANCH
