@@ -1,4 +1,4 @@
-name: Auto sync + build
+name: Auto sync
 
 on:
   schedule:
@@ -39,4 +39,4 @@ jobs:
 
       - name: Lancer le build si mise à jour
         if: steps.sync.outputs.changed == 'true'
-        run: gh workflow run fork-build.yml --ref "$BRANCH"
+        run: gh workflow run build-release.yml --ref "$BRANCH"
