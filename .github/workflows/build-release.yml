@@ -1,0 +1,166 @@
+name: Build & release (fork)
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: fork-build
+  cancel-in-progress: true
+
+jobs:
+  # ===== ETAPE 1 : compilation sous Windows =====
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: pnpm/action-setup@v5
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web-panel/pnpm-lock.yaml
+
+      - name: Build unsigned executable
+        shell: pwsh
+        run: ./build.ps1 -Configuration Release
+
+      - name: Upload unsigned executable
+        uses: actions/upload-artifact@v6
+        with:
+          name: WandEnhancer-unsigned
+          path: WandEnhancer/bin/Release/WandEnhancer.exe
+          if-no-files-found: error
+
+  # ===== ETAPE 2 : analyse antivirus puis publication =====
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      SHA: ${{ github.sha }}
+      VT_THRESHOLD: 8   # au-dela de X detections, on ne publie pas
+
+    steps:
+      # On recupere les 2 fichiers qui contiennent la version de l'auteur
+      - name: Récupérer les métadonnées de version
+        uses: actions/checkout@v5
+        with:
+          sparse-checkout: |
+            WandEnhancer/Properties/AssemblyInfo.cs
+            CHANGELOG.md
+          sparse-checkout-cone-mode: false
+
+      - name: Lire la version de l'auteur
+        id: ver
+        run: |
+          set -e
+          FILE=WandEnhancer/Properties/AssemblyInfo.cs
+          VERSION=$(grep -oP 'AssemblyVersion\("\K[0-9]+(\.[0-9]+)+' "$FILE" | head -1)
+          if [ -z "$VERSION" ]; then
+            echo "::error::Version introuvable dans $FILE"
+            exit 1
+          fi
+          echo "Version amont : $VERSION"
+          echo "version=$VERSION"          >> "$GITHUB_OUTPUT"
+          echo "build=${VERSION##*.}"      >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION-${SHA:0:7}"  >> "$GITHUB_OUTPUT"
+
+      - name: Extraire les notes du CHANGELOG
+        run: |
+          awk -v v="${{ steps.ver.outputs.version }}" '
+            $0 ~ "^## \\[" v "\\]" { f=1; next }
+            f && /^## \[/ { exit }
+            f { print }
+          ' CHANGELOG.md > notes-upstream.md || true
+
+      # Recuperation de l'executable produit a l'etape 1
+      - name: Télécharger l'exécutable
+        uses: actions/download-artifact@v6
+        with:
+          name: WandEnhancer-unsigned
+          path: dist
+
+      - name: Analyse VirusTotal
+        id: vt
+        env:
+          VT_API_KEY: ${{ secrets.VT_API_KEY }}
+        run: |
+          set -e
+          HASH=$(sha256sum dist/WandEnhancer.exe | cut -d' ' -f1)
+          echo "permalink=https://www.virustotal.com/gui/file/$HASH" >> "$GITHUB_OUTPUT"
+
+          ID=$(curl -s -X POST https://www.virustotal.com/api/v3/files \
+                 -H "x-apikey: $VT_API_KEY" \
+                 -F "file=@dist/WandEnhancer.exe" | jq -r .data.id)
+
+          if [ -z "$ID" ] || [ "$ID" = "null" ]; then
+            echo "::error::Envoi VirusTotal refuse (cle API invalide ou quota atteint)."
+            exit 1
+          fi
+
+          STATUS=""
+          for i in $(seq 1 20); do
+            sleep 30
+            RESP=$(curl -s "https://www.virustotal.com/api/v3/analyses/$ID" -H "x-apikey: $VT_API_KEY")
+            STATUS=$(echo "$RESP" | jq -r .data.attributes.status)
+            echo "Tentative $i : $STATUS"
+            if [ "$STATUS" = "completed" ]; then break; fi
+          done
+
+          if [ "$STATUS" != "completed" ]; then
+            echo "::error::Analyse non terminee dans le temps imparti."
+            exit 1
+          fi
+
+          MAL=$(echo "$RESP" | jq -r .data.attributes.stats.malicious)
+          SUS=$(echo "$RESP" | jq -r .data.attributes.stats.suspicious)
+          TOTAL=$(echo "$RESP" | jq -r '[.data.attributes.stats[]] | add')
+
+          case "$MAL" in ''|*[!0-9]*) echo "::error::Statistiques illisibles."; exit 1;; esac
+
+          echo "Resultat : $MAL malveillant / $SUS suspect / $TOTAL moteurs"
+          echo "verdict=$MAL détections sur $TOTAL moteurs (+$SUS suspects)" >> "$GITHUB_OUTPUT"
+
+          if [ "$MAL" -gt "$VT_THRESHOLD" ]; then
+            echo "::error::Seuil depasse ($MAL > $VT_THRESHOLD). Publication annulee."
+            exit 1
+          fi
+
+      - name: Préparer l'archive
+        run: cd dist && zip "../WandEnhancer-${{ steps.ver.outputs.tag }}.zip" WandEnhancer.exe
+
+      - name: Créer la release
+        run: |
+          {
+            echo "Build non signe, genere depuis le commit \`$SHA\`."
+            echo
+            echo "**Version amont :** ${{ steps.ver.outputs.version }} (build ${{ steps.ver.outputs.build }})"
+            echo "**VirusTotal :** ${{ steps.vt.outputs.verdict }}"
+            echo "Rapport : ${{ steps.vt.outputs.permalink }}"
+            echo
+            echo "Des detections generiques (\`Wacatac!ml\`, \`Krypt\`) sont attendues sur un binaire non signe et sans prevalence."
+            if [ -s notes-upstream.md ]; then
+              echo
+              echo "---"
+              echo
+              echo "### Notes de version de l'auteur"
+              cat notes-upstream.md
+            fi
+          } > notes.md
+
+          gh release create "${{ steps.ver.outputs.tag }}" \
+            "WandEnhancer-${{ steps.ver.outputs.tag }}.zip" \
+            --target "$SHA" \
+            --title "WandEnhancer ${{ steps.ver.outputs.version }} — build ${{ steps.ver.outputs.build }}" \
+            --notes-file notes.md
